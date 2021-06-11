@@ -114,4 +114,21 @@ With predicted evidence (from genre_dpr)
 bash scripts/finetune_masked_pipeline.sh t5-base 1e-4 {masker_name} true false all {ir_method}
 ```
 
-### Testing
+```
+python -m error_correction.corrector.run \
+    --model_name_or_path t5-base \
+    --output_dir <path_to_trained_model_directory> \
+    --do_predict \
+    --test_file <path_to_test_file> \
+    --reader mask \
+    --mutation_source true \
+    --mutation_target false \
+    --labels all
+```
+
+### Language Model Baseline
+
+Greedily decodes tokens
+```
+python -m error_correction.corrector.language_model <masked_file> <output_file>
+```
