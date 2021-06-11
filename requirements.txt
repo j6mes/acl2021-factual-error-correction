@@ -1,0 +1,11 @@
+numpy
+tqdm
+transformers==3.5.1
+torch==1.7
+seqeval
+pymysql
+pytorch-lightning==0.8.5
+fever-drqa
+rouge-score
+lime
+tqdm

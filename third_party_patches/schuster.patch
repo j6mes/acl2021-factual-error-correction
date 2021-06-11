@@ -1,0 +1,933 @@
+diff --git a/allen_configs/mask_generator.jsonnet b/allen_configs/mask_generator.jsonnet
+index 83d7f9d..a4c97b0 100644
+--- a/allen_configs/mask_generator.jsonnet
++++ b/allen_configs/mask_generator.jsonnet
+@@ -3,7 +3,7 @@
+         "directory_path": "vocabulary"
+     },
+     "dataset_reader": {
+-        "type": "snli_with_id",
++        "type": "snli_fec",
+         "token_indexers": {
+             "tokens": {
+               "type": "single_id",
+@@ -16,11 +16,11 @@
+     "test_data_path": "https://www.dropbox.com/s/4soqtup0efvxo3m/nli.test.manual_deletions.jsonl?dl=1",
+     "model": {
+         "type": "mask_generator",
+-        "classifier_dir" : "https://www.dropbox.com/s/3o2trmtk4n8in9q/neutrality_classifier.tar.gz?dl=1",
++        "classifier_dir" : "trained_neutrality_classsifier",
+         "del_perc_lambda": 0,
+         "del_perc": 0,
+         "teacher_lambda": 1.0,
+-        "coverage_lambda": 0.4,
++        "coverage_lambda": 0.2,
+         "transition_lamb": 0.0,
+         "gumbel": false,
+         "neutral_label": "NOT ENOUGH INFO",
+diff --git a/allen_configs/mask_generator_0.3.jsonnet b/allen_configs/mask_generator_0.3.jsonnet
+new file mode 100644
+index 0000000..62766ec
+--- /dev/null
++++ b/allen_configs/mask_generator_0.3.jsonnet
+@@ -0,0 +1,83 @@
++{
++    "vocabulary":{
++        "directory_path": "vocabulary"
++    },
++    "dataset_reader": {
++        "type": "snli_fec",
++        "token_indexers": {
++            "tokens": {
++              "type": "single_id",
++              "lowercase_tokens": true
++            }
++        },
++    },
++    "train_data_path": "https://www.dropbox.com/s/cial78j604u18t1/train.jsonl?dl=1",
++    "validation_data_path": "https://www.dropbox.com/s/r7hj9vk1vg8877v/dev.jsonl?dl=1",
++    "test_data_path": "https://www.dropbox.com/s/4soqtup0efvxo3m/nli.test.manual_deletions.jsonl?dl=1",
++    "model": {
++        "type": "mask_generator",
++        "classifier_dir" : "trained_neutrality_classsifier",
++        "del_perc_lambda": 0,
++        "del_perc": 0,
++        "teacher_lambda": 1.0,
++        "coverage_lambda": 0.3,
++        "transition_lamb": 0.0,
++        "gumbel": false,
++        "neutral_label": "NOT ENOUGH INFO",
++        "bidirectional": true,
++        "attention": "bilinear",
++        "use_hypothesis": true,
++        "text_field_embedder": {
++          "token_embedders": {
++            "tokens": {
++                "type": "embedding",
++                "pretrained_file": "https://allennlp.s3.amazonaws.com/datasets/glove/glove.6B.300d.txt.gz",
++                "embedding_dim": 300,
++                "trainable": false
++            }
++          }
++        },
++        "projection_size": 100,
++        "labeler": {
++            "type": "lstm",
++            "bidirectional": true,
++            "num_layers": 1,
++            "dropout": 0.2,
++            "input_size": 100,
++            "hidden_size": 100
++        },
++        "contextualizer": {
++            "type": "lstm",
++            "bidirectional": true,
++            "num_layers": 1,
++            "dropout": 0.2,
++            "input_size": 300,
++            "hidden_size": 100
++        },
++            },
++    "iterator": {
++        "type": "bucket",
++        "sorting_keys": [
++            [
++                "premise",
++                "num_tokens"
++            ],
++            [
++                "hypothesis",
++                "num_tokens"
++            ]
++        ],
++        "batch_size": 32
++    },
++    "evaluate_on_test": true,
++    "trainer": {
++        "num_epochs": 100,
++        "patience": 10,
++        "cuda_device": 0,
++        "grad_clipping": 5.0,
++        "validation_metric": "+acc_vs_del",
++        "optimizer": {
++            "type": "adagrad"
++        }
++    }
++}
+diff --git a/masker_allen_pkg/dataset_readers/snli.py b/masker_allen_pkg/dataset_readers/snli.py
+index 86ab7cc..951c004 100644
+--- a/masker_allen_pkg/dataset_readers/snli.py
++++ b/masker_allen_pkg/dataset_readers/snli.py
+@@ -88,8 +88,9 @@ class SnliWithID(DatasetReader):
+                          evidence: str = None) -> Instance:
+         # pylint: disable=arguments-differ
+         fields: Dict[str, Field] = {}
+-        premise_tokens = self._tokenizer.tokenize(premise)
+-        hypothesis_tokens = self._tokenizer.tokenize(hypothesis)
++        # swap premise and hypothesis
++        premise_tokens = self._tokenizer.tokenize(hypothesis)
++        hypothesis_tokens = self._tokenizer.tokenize(premise)
+         fields['premise'] = TextField(premise_tokens, self._token_indexers)
+         fields['hypothesis'] = TextField(hypothesis_tokens, self._token_indexers)
+         if label:
+diff --git a/masker_allen_pkg/dataset_readers/snli_fec.py b/masker_allen_pkg/dataset_readers/snli_fec.py
+new file mode 100644
+index 0000000..4b326f9
+--- /dev/null
++++ b/masker_allen_pkg/dataset_readers/snli_fec.py
+@@ -0,0 +1,119 @@
++from typing import Dict
++import json
++import logging
++import numpy as np
++
++from overrides import overrides
++
++from allennlp.common.file_utils import cached_path
++from allennlp.data.dataset_readers.dataset_reader import DatasetReader
++from allennlp.data.fields import Field, TextField, LabelField, MetadataField, ArrayField
++from allennlp.data.instance import Instance
++from allennlp.data.token_indexers import SingleIdTokenIndexer, TokenIndexer
++from allennlp.data.tokenizers import Tokenizer, WordTokenizer
++from allennlp.data.tokenizers.word_splitter import SpacyWordSplitter
++
++logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
++
++
++@DatasetReader.register("snli_fec")
++class SnliWithID(DatasetReader):
++    """
++    Reads a file from the Stanford Natural Language Inference (SNLI) dataset.  This data is
++    formatted as jsonl, one json-formatted instance per line.  The keys in the data are
++    "gold_label", "sentence1", and "sentence2".  We convert these keys into fields named "label",
++    "premise" and "hypothesis", along with a metadata field containing the tokenized strings of the
++    premise and hypothesis.
++
++    Parameters
++    ----------
++    tokenizer : ``Tokenizer``, optional (default=``WordTokenizer()``)
++        We use this ``Tokenizer`` for both the premise and the hypothesis.  See :class:`Tokenizer`.
++    token_indexers : ``Dict[str, TokenIndexer]``, optional (default=``{"tokens": SingleIdTokenIndexer()}``)
++        We similarly use this for both the premise and the hypothesis.  See :class:`TokenIndexer`.
++    """
++
++    def __init__(self,
++                 tokenizer: Tokenizer = None,
++                 token_indexers: Dict[str, TokenIndexer] = None,
++                 lazy: bool = False) -> None:
++        super().__init__(lazy)
++        self._tokenizer = tokenizer or WordTokenizer()
++        self._token_indexers = token_indexers or {'tokens': SingleIdTokenIndexer()}
++
++    @overrides
++    def _read(self, file_path: str):
++        # if `file_path` is a URL, redirect to the cache
++        file_path = cached_path(file_path)
++
++        with open(file_path, 'r') as snli_file:
++            logger.info("Reading SNLI instances from jsonl dataset at: %s", file_path)
++            for line in snli_file:
++                example = json.loads(line)
++
++                label = example["gold_label"]
++                if label == '-':
++                    # These were cases where the annotators disagreed; we'll just skip them.  It's
++                    # like 800 out of 500k examples in the training data.
++                    continue
++
++                premise = example["sentence1"]
++                hypothesis = example["sentence2"]
++
++                if 'id' in example:
++                    e_id = str(example['id'])
++                elif 'pairID' in example:
++                    e_id = str(example['pairID'])
++                else:
++                    e_id = None
++
++                if 'masked_inds' in example and False:
++                    premise_delete = example['masked_inds']
++                else:
++                    premise_delete = None
++
++                evidence = None
++                if 'evidence' in example:
++                    evidence = example['evidence']
++
++                yield self.text_to_instance(premise, hypothesis, label, e_id, premise_delete, evidence)
++
++    @overrides
++    def text_to_instance(self,  # type: ignore
++                         premise: str,
++                         hypothesis: str,
++                         label: str = None,
++                         e_id: str = None,
++                         premise_delete: list = None,
++                         evidence: str = None) -> Instance:
++        # pylint: disable=arguments-differ
++        fields: Dict[str, Field] = {}
++        # swap premise and hypothesis
++        premise_tokens = self._tokenizer.tokenize(hypothesis)
++        hypothesis_tokens = self._tokenizer.tokenize(premise)
++        fields['premise'] = TextField(premise_tokens, self._token_indexers)
++        fields['hypothesis'] = TextField(hypothesis_tokens, self._token_indexers)
++        if label:
++            fields['label'] = LabelField(label)
++
++        if premise_delete:
++            delete_mask = np.zeros(len(premise_tokens))
++            delete_mask[premise_delete] = 1
++            fields['premise_delete'] = ArrayField(delete_mask)
++        else:
++            # vector of '-1' to signal the model to ignore it
++            delete_mask = np.zeros(len(premise_tokens))
++            delete_mask += -1
++            fields['premise_delete'] = ArrayField(delete_mask)
++
++
++
++        metadata = {"premise_tokens": [x.text for x in premise_tokens],
++                    "hypothesis_tokens": [x.text for x in hypothesis_tokens],
++                    "premise_delete": premise_delete,
++                    "id": e_id}
++        if evidence:
++            metadata['evidence'] = evidence
++
++        fields["metadata"] = MetadataField(metadata)
++        return Instance(fields)
+diff --git a/masker_allen_pkg/dataset_readers/snli_fec_final.py b/masker_allen_pkg/dataset_readers/snli_fec_final.py
+new file mode 100644
+index 0000000..6f57318
+--- /dev/null
++++ b/masker_allen_pkg/dataset_readers/snli_fec_final.py
+@@ -0,0 +1,285 @@
++from typing import Dict
++import json
++import logging
++import numpy as np
++import sqlite3
++import os
++import unicodedata
++from overrides import overrides
++
++from allennlp.common.file_utils import cached_path
++from allennlp.data.dataset_readers.dataset_reader import DatasetReader
++from allennlp.data.fields import Field, TextField, LabelField, MetadataField, ArrayField
++from allennlp.data.instance import Instance
++from allennlp.data.token_indexers import SingleIdTokenIndexer, TokenIndexer
++from allennlp.data.tokenizers import Tokenizer, WordTokenizer
++from allennlp.data.tokenizers.word_splitter import SpacyWordSplitter
++
++logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
++
++def normalize(text):
++    """Resolve different type of unicode encodings."""
++    return unicodedata.normalize('NFD', text)
++
++class DocDB(object):
++    """Sqlite backed document storage.
++
++    Implements get_doc_text(doc_id).
++    """
++
++    def __init__(self, db_path=None):
++        self.path = db_path or DEFAULTS['db_path']
++        self.connection = sqlite3.connect(self.path, check_same_thread=False)
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *args):
++        self.close()
++
++    def path(self):
++        """Return the path to the file that backs this database."""
++        return self.path
++
++    def close(self):
++        """Close the connection to the database."""
++        self.connection.close()
++
++    def get_doc_ids(self):
++        """Fetch all ids of docs stored in the db."""
++        cursor = self.connection.cursor()
++        cursor.execute("SELECT id FROM documents")
++        results = [r[0] for r in cursor.fetchall()]
++        cursor.close()
++        return results
++
++    def get_doc_text(self, doc_id):
++        """Fetch the raw text of the doc for 'doc_id'."""
++        cursor = self.connection.cursor()
++        cursor.execute(
++            "SELECT text FROM documents WHERE id = ?",
++            (normalize(doc_id),)
++        )
++        result = cursor.fetchone()
++        cursor.close()
++        return result if result is None else result[0]
++
++
++class FEVERDocumentDatabase(DocDB):
++
++    def __init__(self,path=None):
++        super().__init__(path)
++
++    def get_doc_lines(self, doc_id):
++        """Fetch the raw text of the doc for 'doc_id'."""
++        cursor = self.connection.cursor()
++        cursor.execute(
++            "SELECT lines FROM documents WHERE id = ?",
++            (normalize(doc_id),)
++        )
++        result = cursor.fetchone()
++        cursor.close()
++        return result if result is None else result[0]
++
++    def get_doc_text(self, doc_id):
++        lines = self.get_doc_lines(doc_id)
++
++        if lines is None:
++            return None
++
++        lines = lines.split("\n")
++        return "\n".join([line.split("\t")[1] for line in lines if len(line.split("\t")) > 1])
++
++    def get_non_empty_doc_ids(self):
++        """Fetch all ids of docs stored in the db."""
++        cursor = self.connection.cursor()
++        cursor.execute("SELECT id FROM documents WHERE length(trim(lines)) > 0")
++        results = [r[0] for r in cursor.fetchall()]
++        cursor.close()
++        return results
++
++class FEVERDocumentDatabaseIterable(FEVERDocumentDatabase):
++    def iter_all_doc_lines(self):
++        cursor = self.connection.cursor()
++        cursor.execute("SELECT id,lines FROM documents",())
++        result = cursor.fetchall()
++        return result
++
++class Reader():
++
++    def __init__(self, labels, test=False):
++        self.labels = labels
++        self.test = test
++
++    def read(self, path):
++        logger.info("reading instances from {}".format(path))
++
++        with open(path) as f:
++            for idx, line in enumerate(f):
++                instance = json.loads(line)
++                yield from self.generate_instances(instance)
++
++                if os.getenv("DEBUG") is not None and idx > 10:
++                    break
++
++
++    def generate_instances(self, instance):
++        raise NotImplementedError()
++
++class MutationReader(Reader):
++    def __init__(self, labels, test=False):
++        super().__init__(labels, test)
++        self.db = FEVERDocumentDatabase("/local/scratch-3/jt719/fec/resources/wikipedia/fever.db")
++        self.using_gold = False
++        self.using_pipeline = False
++    def deduplicate(self, evidence):
++        unique = set(map(lambda ev: (ev["page"],ev["line"]), evidence))
++        return unique
++
++    def clean(self, page):
++        return page.replace("_"," ").replace("-LRB-","(").replace("-RRB-",")").replace("-COLON-",":")
++
++    def maybe_format(self, page, evidence):
++        return f"title: {self.clean(page)} context: {self.clean(evidence)}"
++
++    def generate_instances(self, instance):
++        if instance['verdict'] is None or (instance["verdict"] not in self.labels and not self.test):
++            return None
++        collected_evidence = []
++        if False and "pipeline_text" in instance:
++            assert not self.using_gold
++            self.using_pipeline = True
++
++            for page, evidence in instance["pipeline_text"]:
++                collected_evidence.append(self.maybe_format(page, evidence))
++        else:
++            assert not self.using_pipeline
++            self.using_gold = True
++
++            evs = set()
++
++            for e in instance["evidence"]:
++                evs.add((e["page"],e["line"]))
++            for page, line in evs:
++                if page is None or line is None:
++                    continue
++
++                found_page = self.db.get_doc_lines(page.split("#")[0])
++                if found_page is None:
++                    print("Page {} not found".format(page))
++                    continue
++
++                found_page = found_page.split("\n")
++                assert line < len(found_page)
++
++                ev_splits = found_page[line].split("\t")
++                assert len(ev_splits) > 0
++
++                evidence = found_page[line].split("\t")[1].strip()
++                if len(evidence) == 0:
++                    print("Zero evidence for: {} {}".format(page, line))
++                    continue
++
++                assert len(evidence) > 0
++
++                collected_evidence.append(evidence)
++
++
++        for e in collected_evidence:
++            yield {
++                "source": instance["mutated"],
++                "target": instance["original"],
++                "evidence": e,
++                "mutation_type": instance["mutation"],
++                "veracity": instance["verdict"],
++                "original": instance
++        }
++
++
++
++
++
++@DatasetReader.register("snli_fec_final")
++class SnliWithID(DatasetReader):
++    """
++    Reads a file from the Stanford Natural Language Inference (SNLI) dataset.  This data is
++    formatted as jsonl, one json-formatted instance per line.  The keys in the data are
++    "gold_label", "sentence1", and "sentence2".  We convert these keys into fields named "label",
++    "premise" and "hypothesis", along with a metadata field containing the tokenized strings of the
++    premise and hypothesis.
++
++    Parameters
++    ----------
++    tokenizer : ``Tokenizer``, optional (default=``WordTokenizer()``)
++        We use this ``Tokenizer`` for both the premise and the hypothesis.  See :class:`Tokenizer`.
++    token_indexers : ``Dict[str, TokenIndexer]``, optional (default=``{"tokens": SingleIdTokenIndexer()}``)
++        We similarly use this for both the premise and the hypothesis.  See :class:`TokenIndexer`.
++    """
++
++    def __init__(self,
++                 tokenizer: Tokenizer = None,
++                 token_indexers: Dict[str, TokenIndexer] = None,
++                 lazy: bool = False) -> None:
++        super().__init__(lazy)
++        self._tokenizer = tokenizer or WordTokenizer()
++        self._token_indexers = token_indexers or {'tokens': SingleIdTokenIndexer()}
++        self.loader = MutationReader({"SUPPORTS", "REFUTES"})
++
++    @overrides
++    def _read(self, file_path: str):
++        # if `file_path` is a URL, redirect to the cache
++        file_path = cached_path(file_path)
++
++        with open("aaaaa", 'w+') as snli_file:
++            logger.info("Reading SNLI instances from jsonl dataset at: %s", file_path)
++            for instance in self.loader.read(file_path):
++
++                label = instance["veracity"]
++                if label == '-':
++                    # These were cases where the annotators disagreed; we'll just skip them.  It's
++                    # like 800 out of 500k examples in the training data.
++                    continue
++
++                premise = instance["evidence"]
++                hypothesis = instance["source"]
++                premise_delete = None
++                evidence = None
++
++                yield self.text_to_instance(premise, hypothesis, label, premise_delete, instance['target'],instance)
++
++    @overrides
++    def text_to_instance(self,  # type: ignore
++                         premise: str,
++                         hypothesis: str,
++                         label: str = None,
++                         premise_delete: list = None, target:str=None, original=None) -> Instance:
++        # pylint: disable=arguments-differ
++        fields: Dict[str, Field] = {}
++        # swap premise and hypothesis
++        premise_tokens = self._tokenizer.tokenize(hypothesis)
++        hypothesis_tokens = self._tokenizer.tokenize(premise)
++        target_tokens = self._tokenizer.tokenize(target)
++        fields['premise'] = TextField(premise_tokens, self._token_indexers)
++        fields['hypothesis'] = TextField(hypothesis_tokens, self._token_indexers)
++        if label:
++            fields['label'] = LabelField(label)
++
++        if premise_delete:
++            delete_mask = np.zeros(len(premise_tokens))
++            delete_mask[premise_delete] = 1
++            fields['premise_delete'] = ArrayField(delete_mask)
++        else:
++            # vector of '-1' to signal the model to ignore it
++            delete_mask = np.zeros(len(premise_tokens))
++            delete_mask += -1
++            fields['premise_delete'] = ArrayField(delete_mask)
++
++        metadata = {"premise_tokens": [x.text for x in premise_tokens],
++                    "hypothesis_tokens": [x.text for x in hypothesis_tokens],
++                    "premise_delete": premise_delete,
++                    "target":[x.text for x in target_tokens],
++                    "original": original
++                    }
++
++        fields["metadata"] = MetadataField(metadata)
++        return Instance(fields)
+diff --git a/masker_allen_pkg/models/mask_generator.py b/masker_allen_pkg/models/mask_generator.py
+index a549951..5998951 100644
+--- a/masker_allen_pkg/models/mask_generator.py
++++ b/masker_allen_pkg/models/mask_generator.py
+@@ -335,7 +335,10 @@ class MaskGenerator(Model):
+         return out
+
+     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
+-        precision, recall, f1_measure = self._f1_deletions.get_metric(reset)
++        try:
++            precision, recall, f1_measure = self._f1_deletions.get_metric(reset)
++        except:
++            precision, recall, f1_measure = 0.0,0.0,0.0
+         return {
+                 'accuracy': self._accuracy.get_metric(reset),
+                 'delete_size': self._avg_perc_masked.get_metric(reset),
+diff --git a/model_predictions.py b/model_predictions.py
+index f4cc3a1..4b95751 100644
+--- a/model_predictions.py
++++ b/model_predictions.py
+@@ -19,7 +19,7 @@ from allennlp.common.util import prepare_environment
+ from allennlp.common.tqdm import Tqdm
+ from allennlp.data import Instance
+ from allennlp.data.dataset_readers.dataset_reader import DatasetReader
+-from allennlp.data.iterators import DataIterator
++from allennlp.data.iterators import DataIterator, BasicIterator
+ from allennlp.models.archival import load_archive
+ from allennlp.models.model import Model
+ from allennlp.nn import util
+@@ -65,7 +65,7 @@ def evaluate(model: Model,
+
+     with torch.no_grad():
+         model.eval()
+-
++        print(instances[0])
+         iterator = data_iterator(instances,
+                                  num_epochs=1,
+                                  shuffle=False)
+@@ -91,7 +91,7 @@ def evaluate(model: Model,
+             labels = batch['label']
+             premise = batch['premise']['tokens']
+             batch_size = premise.shape[0]
+-
++
+             label_probs = batch_results['label_probs']
+             preds = label_probs.max(1)[1]
+             neutral_probs = label_probs[:,args.target_label]
+@@ -105,7 +105,7 @@ def evaluate(model: Model,
+                 neutral_prob = neutral_probs[i].item()
+                 #hyp = ' '.join(sents['hypothesis_tokens'][:-1])
+                 hyp = ' '.join(sents['hypothesis_tokens'][:])
+-
++                target = ' '.join(sents['target'][:])
+                 rem_inds = torch.nonzero(deleted_inds[i] > 0.5).cpu().numpy()
+                 rem_inds = rem_inds.squeeze().tolist()
+                 if type(rem_inds) == int:
+@@ -125,17 +125,22 @@ def evaluate(model: Model,
+
+                 suc = succeed[i].item()
+
+-                out_dict = {'sentence1': prem,
++                out_dict = sents['original']['original']
++                del sents['original']['original']
++                out_dict.update({'sentence1': prem,
+                             'sentence2': hyp,
+                             'sentence1_masked': prem_rm,
+                             'masked_inds': rem_inds,
++                            'target': target,
+                             'num_masked': len(rem_inds),
+                             'gold_label': label_dict[gold_label],
+                             'label_prob': neutral_prob,
+                             'succeed': suc,
+-                            'id': sents['id'],
+-                            'evidence': sents['evidence']
+-                            }
++                            'metadata': sents['original'],
++                            'original_claim': prem,
++                            'master_explanation': rem_inds
++
++                            })
+
+                 if 'premise_delete' in sents:
+                     teacher_mask = sents['premise_delete']
+@@ -222,18 +227,16 @@ def evaluate_from_args(args: argparse.Namespace) -> Dict[str, Any]:
+     # Try to use the validation dataset reader if there is one - otherwise fall back
+     # to the default dataset_reader used for both training and validation.
+     validation_dataset_reader_params = config.pop('validation_dataset_reader', None)
++    config["dataset_reader"]["type"] = "snli_fec_final"
+     if validation_dataset_reader_params is not None:
+         dataset_reader = DatasetReader.from_params(validation_dataset_reader_params)
+     else:
+-        dataset_reader = DatasetReader.from_params(config.pop('dataset_reader'))
++        dataset_reader = DatasetReader.from_params(config.pop("dataset_reader"))
+     evaluation_data_path = args.input_file
+     print("Reading evaluation data from %s", evaluation_data_path)
+     instances = dataset_reader.read(evaluation_data_path)
+
+-    iterator_params = config.pop("validation_iterator", None)
+-    if iterator_params is None:
+-        iterator_params = config.pop("iterator")
+-    iterator = DataIterator.from_params(iterator_params)
++    iterator = BasicIterator(batch_size=32)
+     iterator.index_with(model.vocab)
+
+     metrics = evaluate(model, instances, iterator, args.cuda_device, args.preds_file)
+diff --git a/model_predictions_pipeline.py b/model_predictions_pipeline.py
+new file mode 100644
+index 0000000..c932070
+--- /dev/null
++++ b/model_predictions_pipeline.py
+@@ -0,0 +1,274 @@
++#from allennlp.commands.evaluate import evaluate_from_args
++import argparse
++import os
++import sys
++from itertools import product
++import jsonlines
++from tqdm import tqdm
++
++from typing import Dict, Any, Iterable
++import argparse
++import logging
++import json
++
++import torch
++
++from allennlp.commands.subcommand import Subcommand
++from allennlp.common.checks import check_for_gpu
++from allennlp.common.util import prepare_environment
++from allennlp.common.tqdm import Tqdm
++from allennlp.data import Instance
++from allennlp.data.dataset_readers.dataset_reader import DatasetReader
++from allennlp.data.iterators import DataIterator, BasicIterator
++from allennlp.models.archival import load_archive
++from allennlp.models.model import Model
++from allennlp.nn import util
++from allennlp.common.util import import_submodules
++
++'''
++uses the mask_generator model to output masks
++
++'''
++
++
++label_dict = {0: "SUPPORTS",
++              1: "NOT ENOUGH INFO",
++              2: "REFUTES"
++              }
++
++TARGET_LABEL = 1
++DBG_OUTPUT_BY_DIST = False
++
++parser = argparse.ArgumentParser()
++parser.add_argument('-c', '--cuda_device', type=int, help='id of GPU to use', default=-1)
++parser.add_argument('-w', '--weights_file', type=str, help='path of weights file to use', default='')
++parser.add_argument('-f', '--archive_file', type=str, help='path to tar.gz file path', required=True)
++parser.add_argument('-i', '--input_file', type=str, help='path to the file containing the evaluation data', required=True)
++parser.add_argument('-out', '--preds_file', type=str, help='output file to save the results', default='tmp.jsonl')
++parser.add_argument('-append', action='store_true', help='allow append to previous run', default=False)
++parser.add_argument('-t', '--target_label', type=int, help='label ind', default=TARGET_LABEL)
++
++args = parser.parse_args()
++import_submodules('masker_allen_pkg')
++
++
++def evaluate(model: Model,
++             instances: Iterable[Instance],
++             data_iterator: DataIterator,
++             cuda_device: int,
++             preds_file: str = "") -> Dict[str, Any]:
++    _warned_tqdm_ignores_underscores = False
++    check_for_gpu(cuda_device)
++
++    if preds_file:
++        out_writer = jsonlines.open(preds_file, mode='a')
++
++    with torch.no_grad():
++        model.eval()
++        print(instances[0])
++        iterator = data_iterator(instances,
++                                 num_epochs=1,
++                                 shuffle=False)
++        print("Iterating over dataset")
++        generator_tqdm = Tqdm.tqdm(iterator, total=data_iterator.get_num_batches(instances))
++
++        batch_count = 0
++        loss_count = 0
++        total_loss = 0.0
++        total_corrects = 0
++        total_count = 0
++
++        tot_teacher_mask = 0
++        tot_teacher_covered = 0
++        tot_predicted_mask = 0
++
++        for batch in generator_tqdm:
++            batch_count += 1
++            batch = util.move_to_device(batch, cuda_device)
++            batch_results = model(**batch)
++            loss = batch_results.get("loss")
++
++            labels = batch['label']
++            premise = batch['premise']['tokens']
++            batch_size = premise.shape[0]
++
++            label_probs = batch_results['label_probs']
++            preds = label_probs.max(1)[1]
++            neutral_probs = label_probs[:,args.target_label]
++
++            deleted_inds = batch_results['deleted_inds']
++
++            succeed = (preds == args.target_label)
++
++            for i, sents in enumerate(batch['metadata']):
++                gold_label = labels[i].item()
++                neutral_prob = neutral_probs[i].item()
++                #hyp = ' '.join(sents['hypothesis_tokens'][:-1])
++                hyp = ' '.join(sents['hypothesis_tokens'][:])
++                target = ' '.join(sents['target'][:])
++                rem_inds = torch.nonzero(deleted_inds[i] > 0.5).cpu().numpy()
++                rem_inds = rem_inds.squeeze().tolist()
++                if type(rem_inds) == int:
++                    rem_inds = [rem_inds]
++
++                #prem_words = sents['premise_tokens'][:-1]
++                prem_words = sents['premise_tokens'][:]
++                prem = ' '.join(prem_words)
++                prem_rm_words = []
++                for ind, word in enumerate(prem_words):
++                    if deleted_inds[i][ind] > 0.5:
++                        prem_rm_words.append('$$')
++                    else:
++                        prem_rm_words.append(word)
++
++                prem_rm = ' '.join(prem_rm_words)
++
++                suc = succeed[i].item()
++
++                out_dict = {'sentence1': prem,
++                            'sentence2': hyp,
++                            'sentence1_masked': prem_rm,
++                            'masked_inds': rem_inds,
++                            'target': target,
++                            'num_masked': len(rem_inds),
++                            'gold_label': label_dict[gold_label],
++                            'label_prob': neutral_prob,
++                            'succeed': suc,
++                            'original': sents['original']
++                            }
++
++                if 'premise_delete' in sents:
++                    teacher_mask = sents['premise_delete']
++                    if teacher_mask is not None:
++                        out_dict['teacher_mask'] = teacher_mask
++
++                        true_num = len(teacher_mask)
++                        true_covered = len(set(teacher_mask) & set(rem_inds))
++
++                        predicted_num = len(rem_inds)
++
++                        tot_teacher_mask += true_num
++                        tot_teacher_covered += true_covered
++                        tot_predicted_mask += predicted_num
++
++                if DBG_OUTPUT_BY_DIST:
++                    gold_del = batch['premise_delete'][i]
++                    recall = torch.mul(gold_del, deleted_inds[i])
++                    dist = torch.dist(recall, gold_del, p=1).item()
++                    if dist < 1:
++                        continue
++                    else:
++                        out_dict['dist_from_gold'] = dist
++
++                out_writer.write(out_dict)
++
++            corrects = torch.sum(succeed).item()
++
++            total_corrects += corrects
++            total_count += batch_size
++
++            metrics = model.get_metrics()
++
++            if loss is not None:
++                loss_count += 1
++                metrics["loss"] = loss.item()
++                total_loss += loss.item()
++
++            if (not _warned_tqdm_ignores_underscores and
++                        any(metric_name.startswith("_") for metric_name in metrics)):
++                print("Metrics with names beginning with \"_\" will "
++                               "not be logged to the tqdm progress bar.")
++                _warned_tqdm_ignores_underscores = True
++            description = ', '.join(["%s: %.2f" % (name, value) for name, value
++                                     in metrics.items() if not name.startswith("_")]) + " ||"
++            generator_tqdm.set_description(description, refresh=False)
++
++        final_metrics = model.get_metrics(reset=True)
++        if loss_count > 0:
++            if loss_count != batch_count:
++                raise RuntimeError("The model you are trying to evaluate only sometimes " +
++                                   "produced a loss!")
++            final_metrics["loss"] = total_loss/batch_count
++
++        print("Modified to neutral accuracy: {:.2f}".format(total_corrects/ total_count))
++
++        if tot_teacher_mask > 0 :
++            recall = tot_teacher_covered / tot_teacher_mask
++            prec = tot_teacher_covered / tot_predicted_mask
++            f1 = 2*recall*prec / (recall + prec)
++            print("Recall: {:.2f} ( {} / {} ), Precision: {:.2f} ( {} / {} ), F1: {:.2f}".format(recall, tot_teacher_covered, tot_teacher_mask, prec, tot_teacher_covered, tot_predicted_mask, f1))
++            final_metrics['recall'] = recall
++            final_metrics['precision'] = prec
++            final_metrics['F1'] = f1
++
++        out_writer.close()
++        return final_metrics
++
++def evaluate_from_args(args: argparse.Namespace) -> Dict[str, Any]:
++    # Disable some of the more verbose logging statements
++    #logging.getLogger('allennlp.common.params').disabled = True
++    #logging.getLogger('allennlp.nn.initializers').disabled = True
++    #logging.getLogger('allennlp.modules.token_embedders.embedding').setLevel(logging.INFO)
++
++    # Load from archive
++    archive = load_archive(args.archive_file, args.cuda_device, args.overrides, args.weights_file)
++    config = archive.config
++    prepare_environment(config)
++    model = archive.model
++    model.eval()
++
++    # Load the evaluation data
++
++    # Try to use the validation dataset reader if there is one - otherwise fall back
++    # to the default dataset_reader used for both training and validation.
++    validation_dataset_reader_params = config.pop('validation_dataset_reader', None)
++    config["dataset_reader"]["type"] = "snli_fec_final"
++    if validation_dataset_reader_params is not None:
++        dataset_reader = DatasetReader.from_params(validation_dataset_reader_params)
++    else:
++        dataset_reader = DatasetReader.from_params(config.pop('dataset_reader'))
++    evaluation_data_path = args.input_file
++    print("Reading evaluation data from %s", evaluation_data_path)
++    instances = dataset_reader.read(evaluation_data_path)
++
++    iterator = BasicIterator(batch_size=32)
++    iterator.index_with(model.vocab)
++
++    metrics = evaluate(model, instances, iterator, args.cuda_device, args.preds_file)
++
++    print("Finished evaluating.")
++    print("Metrics:")
++    for key, metric in metrics.items():
++        print("%s: %s", key, metric)
++
++    output_file = args.log_file
++    if output_file:
++        with open(output_file, "w") as file:
++            json.dump(metrics, file, indent=4)
++    return metrics
++
++
++if __name__ == '__main__':
++    if not args.append:
++        assert(not os.path.exists(args.preds_file))
++
++    dir_name, file_name = os.path.split(args.preds_file)
++    os.makedirs(dir_name, exist_ok=True)
++
++    file_path, file_ext = os.path.splitext(args.preds_file)
++    log_file_ext = '.log'
++    log_file = '{}{}'.format(file_path, log_file_ext)
++
++    input_args = argparse.Namespace()
++    input_args.cuda_device = args.cuda_device
++    input_args.archive_file = args.archive_file
++    input_args.input_file = args.input_file
++    input_args.overrides = ''
++    input_args.overrides = ''
++    input_args.weights_file = args.weights_file
++    input_args.output_file = ''
++    input_args.preds_file = args.preds_file
++    input_args.log_file = log_file
++    input_args.target_label = args.target_label
++    metrics = evaluate_from_args(input_args)
++    print(metrics)
