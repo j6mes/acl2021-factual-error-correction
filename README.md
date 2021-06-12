@@ -1,6 +1,8 @@
 # About
 This is the code release to support the following paper, accepted at ACL2021: [Evidence-based Factual Error Correction](https://export.arxiv.org/pdf/2106.01072) by James Thorne and Andreas Vlachos, University of Cambridge.
 
+![Training/Testing Example](example.png)
+
 ## Data
 Can be downloaded from this [Google Drive](https://drive.google.com/open?id=1hzwg5NtVUB_cfXiADkSanCq0JjaQ87tV) folder. Thank you for Nicola de Cao for generating the GENRE predictions, they have been merged with the predictions from DPR using the code release from this [Github Repo](https://github.com/facebookresearch/DPR). The merge script is in `src/error_correction/dataset_utils/filter_dpr_genre.py`.
 
