@@ -1,5 +1,5 @@
 # About
-This is the code release to support the following paper, accepted at ACL2021: [Evidence-based Factual Error Correction](https://export.arxiv.org/pdf/2106.01072) by James Thorne and Andreas Vlachos, University of Cambridge.
+This is the code release to support the following paper, accepted at ACL2021: [Evidence-based Factual Error Correction](https://arxiv.org/abs/2012.15788) by James Thorne and Andreas Vlachos, University of Cambridge.
 
 ![Training/Testing Example](example.png)
 
