@@ -30,6 +30,7 @@ from error_correction.modelling.callback.seq2seq_logging_callback import (
     Seq2SeqLoggingCallback,
 )
 from error_correction.modelling.lightning_base import generic_train
+from error_correction.modelling.classifier_module import FEVERClassifierModule
 
 logger = logging.getLogger(__name__)
 
