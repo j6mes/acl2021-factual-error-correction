@@ -3,7 +3,7 @@ reader=$2
 ns=$3
 dpr=$4
 
-python -m fec.modelling.finetune_fever \
+python -m error_correction.modelling.finetune_fever \
   --model_name_or_path bert-base-uncased \
   --learning_rate $lr \
   --num_train_epochs 3 \
